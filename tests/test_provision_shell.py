@@ -316,6 +316,10 @@ case "$CMD" in
         esac
         ;;
     create)
+        # Record the raw create argv before the parse loop consumes it.
+        if [ -n "${DOCKER_STUB_CREATE_LOG:-}" ]; then
+            printf 'create %s\\n' "$*" >> "$DOCKER_STUB_CREATE_LOG"
+        fi
         NAME=""
         while [ "$#" -gt 0 ]; do
             case "$1" in
@@ -883,6 +887,184 @@ def test_direct_mode_builds_once_starts_once_and_reuses(tmp_path, stubs):
         assert "state: running" in status.stdout
     finally:
         teardown()
+
+
+def test_direct_mode_defaults_to_all_cpus(tmp_path, stubs):
+    """A direct/standalone container gets ALL host cores, not one.
+
+    Regression: ``LEGACY_CPUS`` defaulted to 1, so a container created by the
+    bundle without a gateway-supplied ``COMPUTEMCP_CPUS_PER_NODE`` ran on a
+    single core.  With no CPU env set the create argv must request
+    ``--cpus <nproc --all>``; an inherited ``OMP_NUM_THREADS`` must NOT change
+    that (plain ``nproc`` would, hence ``--all``).
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "cpus"
+    workdir.mkdir()
+    storage = workdir / "storage"
+
+    env = _base_env("cpustest", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_CREATE_LOG"] = str(workdir / "create.log")
+    env["PATH"] = stubs.direct.shell_path
+    # An inherited single-thread hint must not pin the container to one core.
+    env.pop("COMPUTEMCP_CPUS_PER_NODE", None)
+    env.pop("COMPUTEMCP_CPUS", None)
+    env["OMP_NUM_THREADS"] = "1"
+
+    expected = subprocess.run(
+        ["nproc", "--all"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=workdir,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        create = (workdir / "create.log").read_text(encoding="utf-8", errors="replace")
+        assert f"--cpus {expected}" in create, (
+            f"expected --cpus {expected} (all cores); got:\n{create}"
+        )
+    finally:
+        _cleanup()
+
+
+def test_direct_mode_explicit_cpus_wins(tmp_path, stubs):
+    """An explicit COMPUTEMCP_CPUS overrides the all-cores default."""
+    container_port = _free_port()
+    workdir = tmp_path / "cpusexplicit"
+    workdir.mkdir()
+    storage = workdir / "storage"
+
+    env = _base_env("cpuexplicit", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_CREATE_LOG"] = str(workdir / "create.log")
+    env["PATH"] = stubs.direct.shell_path
+    env.pop("COMPUTEMCP_CPUS_PER_NODE", None)
+    env["COMPUTEMCP_CPUS"] = "3"
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=workdir,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        create = (workdir / "create.log").read_text(encoding="utf-8", errors="replace")
+        assert "--cpus 3" in create, create
+    finally:
+        _cleanup()
+
+
+def test_direct_mode_gpu_vendors_none_disables_exposure(tmp_path, stubs):
+    """The literal ``none`` opts a target out of GPU exposure.
+
+    Without an explicit vendor the bundle now auto-detects; ``none`` is the
+    escape hatch that keeps a deliberately CPU-only container possible.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "gpunone"
+    workdir.mkdir()
+    storage = workdir / "storage"
+
+    env = _base_env("gpunone", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_CREATE_LOG"] = str(workdir / "create.log")
+    env["PATH"] = stubs.direct.shell_path
+    env["COMPUTEMCP_GPU_VENDORS"] = "none"
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=workdir,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        create = (workdir / "create.log").read_text(encoding="utf-8", errors="replace")
+        assert "--gpus" not in create, create
+        assert "--device /dev/dri" not in create, create
+    finally:
+        _cleanup()
+
+
+def test_direct_mode_explicit_gpu_vendor_emits_device_flags(tmp_path, stubs):
+    """An explicit ``container.gpus`` vendor reaches the create argv.
+
+    ``nvidia`` must request ``--gpus all`` (the NVIDIA Container Toolkit path);
+    this is the flag whose absence left ``nvidia-smi`` failing inside.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "gpunvidia"
+    workdir.mkdir()
+    storage = workdir / "storage"
+
+    env = _base_env("gpunvidia", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_CREATE_LOG"] = str(workdir / "create.log")
+    env["PATH"] = stubs.direct.shell_path
+    env["COMPUTEMCP_GPU_VENDORS"] = "nvidia"
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=workdir,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        create = (workdir / "create.log").read_text(encoding="utf-8", errors="replace")
+        assert "--gpus all" in create, create
+    finally:
+        _cleanup()
+
+
+def test_direct_mode_autodetects_nvidia_from_device_presence(tmp_path, stubs):
+    """No ``container.gpus`` set: the bundle auto-detects NVIDIA from the host.
+
+    Regression: with an empty vendor list the device flags were never emitted,
+    so a GPU node produced a CPU-only container and ``nvidia-smi`` failed.  The
+    ``COMPUTEMCP_DEV_DIR`` seam lets the test present an ``nvidiactl`` node
+    without a real GPU.
+    """
+    container_port = _free_port()
+    workdir = tmp_path / "gpuauto"
+    workdir.mkdir()
+    storage = workdir / "storage"
+    devdir = workdir / "dev"
+    devdir.mkdir()
+    # Presence, not type: a device node stands in for /dev/nvidiactl.
+    (devdir / "nvidiactl").touch()
+
+    env = _base_env("gpuauto", storage, container_port)
+    env["DOCKER_STUB_PUBLISHED_PORT"] = str(_published_port(container_port))
+    env["SLURM_STUB_LOG"] = str(workdir / "slurm.log")
+    env["DOCKER_STUB_LOG"] = str(workdir / "docker.log")
+    env["DOCKER_STUB_STATE"] = str(workdir / "dockerstate")
+    env["DOCKER_STUB_CREATE_LOG"] = str(workdir / "create.log")
+    env["PATH"] = stubs.direct.shell_path
+    env.pop("COMPUTEMCP_GPU_VENDORS", None)
+    env["COMPUTEMCP_DEV_DIR"] = str(devdir)
+
+    try:
+        result = subprocess.run(
+            ["bash", str(PROVISION), "provision"],
+            capture_output=True, text=True, timeout=180, env=env, cwd=workdir,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        assert "Auto-detected GPU vendors: nvidia" in result.stderr, result.stderr
+        create = (workdir / "create.log").read_text(encoding="utf-8", errors="replace")
+        assert "--gpus all" in create, create
+    finally:
+        _cleanup()
 
 
 def test_default_container_name_includes_uid(tmp_path, stubs):

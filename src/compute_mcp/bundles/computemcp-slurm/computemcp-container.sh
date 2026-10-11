@@ -82,7 +82,35 @@ fi
 
 RUNTIME="${COMPUTEMCP_CONTAINER_RUNTIME:-}"
 IMAGE="${COMPUTEMCP_IMAGE:-}"
+
+# GPU vendors to expose.  An explicit COMPUTEMCP_GPU_VENDORS (from the target's
+# ``container.gpus``) always wins; the literal ``none`` disables GPU exposure.
+# When it is empty/unset we auto-detect from the host: without this a GPU node
+# silently produced a CPU-only container (the device flags are emitted only for
+# a selected vendor, so an empty list meant no ``--gpus``/``--device`` at all
+# and ``nvidia-smi`` failed inside).  ``COMPUTEMCP_DEV_DIR`` overrides the probed
+# device root (default ``/dev``) -- an operator knob and the test seam.
+DEV_DIR="${COMPUTEMCP_DEV_DIR:-/dev}"
+detect_gpu_vendors() {
+    local -a FOUND=()
+    # NVIDIA: the management/control device appears only once the kernel
+    # driver is loaded; presence implies the NVIDIA Container Toolkit is the
+    # right way to expose them (``--gpus all``).
+    if [ -e "$DEV_DIR/nvidiactl" ] || [ -e "$DEV_DIR/nvidia0" ]; then FOUND+=(nvidia); fi
+    # AMD: /dev/kfd is the ROCm compute node (also needs the DRM nodes).
+    if [ -e "$DEV_DIR/kfd" ]; then FOUND+=(amd); fi
+    # Intel: only claim the DRM render nodes when no other vendor matched, so a
+    # plain integrated-GPU host still gets /dev/dri without a wrong vendor.
+    if [ "${#FOUND[@]}" -eq 0 ] && [ -d "$DEV_DIR/dri" ]; then FOUND+=(intel); fi
+    (IFS=,; printf '%s' "${FOUND[*]}")
+}
 GPU_VENDORS="${COMPUTEMCP_GPU_VENDORS:-}"
+if [ "${GPU_VENDORS,,}" = none ]; then
+    GPU_VENDORS=""
+elif [ -z "$GPU_VENDORS" ]; then
+    GPU_VENDORS="$(detect_gpu_vendors)"
+    [ -n "$GPU_VENDORS" ] && echo "Auto-detected GPU vendors: $GPU_VENDORS" >&2
+fi
 
 # Canonicalize COMPUTEMCP_IMAGE.  A doubled ``docker://`` prefix is a common
 # typo (e.g. retyped on top of the wizard default); apptainer would then treat
@@ -120,7 +148,12 @@ DOCKER_RESTART="unless-stopped"
 
 # Legacy/manual fallbacks used only when the gateway DID NOT provide the
 # corresponding COMPUTEMCP_* variable.  They never override gateway values.
-LEGACY_CPUS="${COMPUTEMCP_CPUS:-1}"
+# CPU default is ALL available cores, not 1: a direct/standalone container
+# launched by the bundle otherwise ran on a single core, which broke parallel
+# builds and benchmarks.  ``nproc --all`` is deliberate -- plain ``nproc``
+# honours OMP_NUM_THREADS and the current CPU affinity, so an inherited
+# OMP_NUM_THREADS=1 would silently pin the container back to one core.
+LEGACY_CPUS="${COMPUTEMCP_CPUS:-$(nproc --all 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 LEGACY_MEMORY="${COMPUTEMCP_MEMORY:-20G}"
 
 if ! { [[ "$SYSTEM" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ "$SYSTEM" != . ] && [ "$SYSTEM" != .. ]; }; then

@@ -187,6 +187,22 @@ The Docker path adds `--gpus all` for NVIDIA, `/dev/kfd` plus
 and skips a vendor whose device node is missing.  Devices are shared; these
 flags do not reserve GPUs.
 
+When `gpus` is empty/unset the helper **auto-detects** the host's vendors
+(NVIDIA from `/dev/nvidiactl` or `/dev/nvidia0`, AMD from `/dev/kfd`, Intel from
+`/dev/dri` when neither of the others matched) so a GPU node does not silently
+produce a CPU-only container.  Set `gpus = ["none"]` (or
+`COMPUTEMCP_GPU_VENDORS=none`) to opt a target out of GPU exposure entirely.
+`COMPUTEMCP_DEV_DIR` overrides the probed device root (default `/dev`).
+
+## CPU allocation
+
+The container gets **all host cores** by default.  The Docker path requests
+`--cpus "$(nproc --all)"` unless the gateway supplies `COMPUTEMCP_CPUS_PER_NODE`
+(the resolved Slurm plan) or the operator sets `COMPUTEMCP_CPUS`.  `nproc --all`
+is deliberate: plain `nproc` honours `OMP_NUM_THREADS` and the current CPU
+affinity, so an inherited single-thread hint would otherwise pin the container
+to one core.  The Apptainer path is unconstrained by design (no cgroup limit).
+
 ## Manual and legacy use
 
 The helper works with an empty gateway environment.  When
