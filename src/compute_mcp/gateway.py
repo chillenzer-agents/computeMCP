@@ -40,6 +40,8 @@ from .config import (
     default_config_path,
     default_token_path,
     load_config,
+    remove_client,
+    remove_token_hash,
     validate_target_name,
 )
 from .enrollment import (
@@ -1496,6 +1498,67 @@ class Gateway:
         closed = await self.sessions.close_all_for_client(name, reason="admin closed")
         return web.json_response({"client": name, "closed": closed})
 
+    async def h_remove_client(self, request: web.Request) -> web.Response:
+        """Revoke a client: remove its config block + token, close its sessions.
+
+        Admin-only.  This is the counterpart of enrollment approval: it deletes
+        the ``[clients.<id>]`` table from wherever it lives in the config
+        include chain, removes the matching ``tokens.toml`` entry, closes the
+        client's live sessions, and reloads so the token is rejected with 401.
+
+        Guardrails (all overridable with ``?force=true``, admin-only already):
+        the last remaining client is never removed (the config requires at
+        least one), and an admin cannot revoke the client it is authenticated
+        as unless forced.
+        """
+        caller = self._auth(request)
+        caller.require_admin()
+        name = request.match_info["client"]
+        if name not in self.config.clients:
+            raise web.HTTPNotFound(text="unknown client")
+        force = self._query_bool(request, "force")
+
+        if name == caller.client_id and not force:
+            raise web.HTTPBadRequest(
+                text=(
+                    f"refusing to revoke the client you are authenticated as "
+                    f"({name!r}); re-run with force to lock yourself out"
+                )
+            )
+        if len(self.config.clients) <= 1:
+            raise web.HTTPBadRequest(
+                text="refusing to revoke the last client; the config requires at least one"
+            )
+
+        path = self.config.config_path
+        if not path:
+            raise ConfigError("no config path recorded; cannot revoke a client")
+
+        # Stop the client's work before its credential disappears, so a live
+        # session cannot outlive the revocation.
+        closed = await self.sessions.close_all_for_client(name, reason="client revoked")
+
+        remove_client(path, name)
+        try:
+            token_path = self.config.token_file or str(Path(path).parent / "tokens.toml")
+            token_removed = remove_token_hash(token_path, name)
+        except Exception:
+            # The config block is already gone, so the revocation itself
+            # succeeded; a failed token cleanup is reported, not fatal.
+            log.exception("revoking client %r: token entry cleanup failed", name)
+            token_removed = False
+
+        await self.reload()
+        log.info("revoked client %r (closed %d session(s))", name, closed)
+        return web.json_response(
+            {
+                "client": name,
+                "removed": True,
+                "token_removed": token_removed,
+                "closed": closed,
+            }
+        )
+
     async def h_reload(self, request: web.Request) -> web.Response:
         client = self._auth(request)
         client.require_admin()
@@ -1880,6 +1943,7 @@ class Gateway:
         router.add_get("/v1/clients/{client}", self.h_get_client)
         router.add_get("/v1/clients/{client}/sessions", self.h_client_sessions)
         router.add_delete("/v1/clients/{client}/sessions", self.h_client_sessions_close)
+        router.add_delete("/v1/clients/{client}", self.h_remove_client)
         router.add_post("/v1/enroll", self.h_enroll_create)
         router.add_get("/v1/enroll/{request}", self.h_enroll_poll)
         router.add_get("/v1/enroll-requests", self.h_enroll_list)

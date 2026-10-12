@@ -1466,6 +1466,98 @@ def append_client(
         raise
 
 
+def _strip_client_block(text: str, client_id: str) -> tuple[str, bool]:
+    """Remove a ``[clients.<id>]`` TOML table from *text*.
+
+    Line-based so operator comments elsewhere survive.  The header is matched by
+    name (unquoted, as :func:`append_client` writes it) and, for robustness,
+    with the quoted spelling too.  Everything from the header up to the next
+    top-level table header (or EOF) is dropped, along with one immediately
+    preceding blank line.  Returns ``(new_text, removed)``.
+    """
+    wanted = {f"[clients.{client_id}]", f"[clients.{_toml_quote(client_id)}]"}
+    lines = text.splitlines()
+    out: list[str] = []
+    removed = False
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        if skipping:
+            # Any new table header ends the block; everything else belongs to it.
+            if stripped.startswith("["):
+                skipping = False
+            else:
+                continue
+        if not skipping and stripped in wanted:
+            removed = True
+            skipping = True
+            # Drop one immediately-preceding blank line for a clean result.
+            if out and out[-1].strip() == "":
+                out.pop()
+            continue
+        out.append(line)
+    if not removed:
+        return text, False
+    new_text = "\n".join(out)
+    if text.endswith("\n"):
+        new_text += "\n"
+    return new_text, True
+
+
+def remove_client(config_path: str | Path, client_id: str) -> bool:
+    """Remove ``client_id``'s ``[clients.<id>]`` block from its config file.
+
+    Searches the entry file and every file in its ``include`` chain (the block
+    may live in either).  The edited file is re-validated afterwards; if the
+    removal would leave an invalid configuration (e.g. no clients at all) the
+    previous content is restored and the ``ConfigError`` propagates.  Returns
+    ``True`` when a block was removed, ``False`` when the client is not defined
+    in any file.
+    """
+    validate_target_name(client_id)
+    entry = Path(config_path)
+    merged, ordered = _load_toml_files(entry)
+    if client_id not in merged.get("clients", {}):
+        return False
+
+    for path in [entry, *ordered]:
+        original = path.read_text()
+        new_text, removed = _strip_client_block(original, client_id)
+        if not removed:
+            continue
+        _atomic_write(path, new_text)
+        try:
+            load_config(entry, token_file=None)
+        except ConfigError:
+            _atomic_write(path, original)
+            raise
+        return True
+    # Present in the merged view but not located textually (e.g. a computed
+    # include): refuse rather than report a false success.
+    raise ConfigError(
+        f"client {client_id!r} is defined in the merged configuration but its "
+        "[clients.*] block could not be located in any file"
+    )
+
+
+def remove_token_hash(token_path: str | Path, client_id: str) -> bool:
+    """Remove ``client_id``'s entry from the ``[tokens]`` table.
+
+    Deletes the matching assignment line (either the quoted ``"<id>"`` spelling
+    or the bare one).  A missing file or entry is a no-op returning ``False``.
+    """
+    path = Path(token_path)
+    if not path.exists():
+        return False
+    lines = path.read_text().splitlines()
+    wanted = (f"{_toml_quote(client_id)} =", f"{client_id} =")
+    out = [line for line in lines if not line.strip().startswith(wanted)]
+    if len(out) == len(lines):
+        return False
+    _atomic_write(path, "\n".join(out).rstrip("\n") + "\n", mode=0o600)
+    return True
+
+
 def append_token_hash(
     token_path: str | Path, client_id: str, token: str, *, create: bool = True
 ) -> None:

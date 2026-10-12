@@ -16,6 +16,7 @@ Examples::
     computeMCP-gatewayctl client-connect alpaka
     computeMCP-gatewayctl client-stop alpaka
     computeMCP-gatewayctl client-kill alpaka
+    computeMCP-gatewayctl client-revoke alpaka
     computeMCP-gatewayctl reload
 """
 
@@ -232,6 +233,17 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("name")
         p.add_argument("target", nargs="?", help="limit to one target")
 
+    p = sub.add_parser(
+        "client-revoke",
+        help="revoke a client: remove its config block + token, close its "
+             "sessions, reload (admin)",
+    )
+    p.add_argument("name")
+    p.add_argument(
+        "--force", action="store_true",
+        help="allow revoking the client you are authenticated as (locks you out)",
+    )
+
     return parser
 
 
@@ -354,6 +366,19 @@ async def _run(args: argparse.Namespace) -> int:
         elif cmd == "target-stop":
             body = await control.request("POST", f"/v1/targets/{args.target}/stop")
             _emit(args, body, lambda b: f"{b['name']} -> {b['state']}")
+        elif cmd == "client-revoke":
+            path = f"/v1/clients/{args.name}"
+            if getattr(args, "force", False):
+                path += "?force=true"
+            body = await control.request("DELETE", path)
+            _emit(
+                args,
+                body,
+                lambda b: (
+                    f"revoked {b['client']} "
+                    f"(token_removed={b['token_removed']}, closed {b['closed']} session(s))"
+                ),
+            )
         elif cmd.startswith("client-"):
             await _client_action(args, control, config, cmd[len("client-"):])
         else:

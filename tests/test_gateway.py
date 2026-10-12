@@ -399,6 +399,31 @@ async def test_reload_add_remove_unchanged(tmp_path):
 
 
 async def test_reload_malformed_keeps_old_config(tmp_path):
+    cfg_file.write_text(
+        """
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    from compute_mcp.config import ConfigError, load_config
+
+    cfg = load_config(cfg_file)
+    gw = Gateway(cfg)
+    cfg_file.write_text("this is = = not toml")
+    with pytest.raises(ConfigError):
+        await gw.reload()
+    assert set(gw.runtimes) == {"hal"}
+
+
+async def test_reload_malformed_keeps_old_config(tmp_path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
         """
@@ -422,6 +447,177 @@ async def test_reload_malformed_keeps_old_config(tmp_path):
     with pytest.raises(ConfigError):
         await gw.reload()
     assert set(gw.runtimes) == {"hal"}
+
+
+# -- client revocation (DELETE /v1/clients/{client}) -------------------------
+
+def _write_revocable_config(cfg_file, tokens_file):
+    """A config with an admin + a project client, plus a hashed token file."""
+    cfg_file.write_text(
+        """
+        # keep me
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [clients.alpaka]
+        token = "alpaka-token"
+        targets = ["hal"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    tokens_file.write_text(
+        '[tokens]\n"alpaka" = "%%%" \n'.replace("%%%", hash_token("alpaka-token"))
+    )
+
+
+async def test_revoke_client_removes_config_and_rejects_token(tmp_path):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    _write_revocable_config(cfg_file, tokens_file)
+
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        # alpaka authenticates before revocation.
+        assert (await client.get("/v1/targets", headers=auth("alpaka-token"))).status == 200
+
+        resp = await client.delete("/v1/clients/alpaka", headers=auth("admin-token"))
+        assert resp.status == 200
+        body = await resp.json()
+        assert body["client"] == "alpaka" and body["removed"] is True
+
+        # The block and the token entry are gone from disk; comments survive.
+        text = cfg_file.read_text()
+        assert "[clients.alpaka]" not in text
+        assert "# keep me" in text and "[clients.admin]" in text
+        assert "alpaka" not in tokens_file.read_text()
+
+        # The revoked token is now rejected; the admin still works.
+        assert (await client.get("/v1/targets", headers=auth("alpaka-token"))).status == 401
+        assert (await client.get("/v1/targets", headers=auth("admin-token"))).status == 200
+        assert set(gw.config.clients) == {"admin"}
+    finally:
+        await client.close()
+
+
+async def test_revoke_unknown_client_is_404(tmp_path):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    _write_revocable_config(cfg_file, tokens_file)
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        resp = await client.delete("/v1/clients/ghost", headers=auth("admin-token"))
+        assert resp.status == 404
+    finally:
+        await client.close()
+
+
+async def test_revoke_requires_admin(tmp_path):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    _write_revocable_config(cfg_file, tokens_file)
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        # alpaka is not admin: forbidden.
+        resp = await client.delete("/v1/clients/admin", headers=auth("alpaka-token"))
+        assert resp.status == 403
+    finally:
+        await client.close()
+
+
+async def test_revoke_self_requires_force(tmp_path):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    _write_revocable_config(cfg_file, tokens_file)
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        # admin revoking itself is refused without force ...
+        resp = await client.delete("/v1/clients/admin", headers=auth("admin-token"))
+        assert resp.status == 400
+        assert "authenticated as" in (await resp.text())
+        # ... and allowed with force=true.
+        resp = await client.delete(
+            "/v1/clients/admin?force=true", headers=auth("admin-token")
+        )
+        assert resp.status == 200
+    finally:
+        await client.close()
+
+
+async def test_revoke_last_client_refused(tmp_path):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    # Only the admin, and it is the caller (force would try to remove the last).
+    cfg_file.write_text(
+        """
+        [clients.admin]
+        token = "admin-token"
+        targets = ["*"]
+
+        [targets.hal]
+        transport = "direct"
+        remote_host = "127.0.0.1"
+        remote_port = 9
+        user = "agent"
+        host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+        """
+    )
+    tokens_file.write_text('[tokens]\n"admin" = "%s"\n' % hash_token("admin-token"))
+    gw = Gateway(load_config(cfg_file))
+    client = await make_client(gw)
+    try:
+        resp = await client.delete(
+            "/v1/clients/admin?force=true", headers=auth("admin-token")
+        )
+        assert resp.status == 400
+        assert "last client" in (await resp.text())
+    finally:
+        await client.close()
+
+
+async def test_revoke_closes_live_sessions(tmp_path, monkeypatch):
+    from compute_mcp.config import load_config
+
+    cfg_file = tmp_path / "config.toml"
+    tokens_file = tmp_path / "tokens.toml"
+    _write_revocable_config(cfg_file, tokens_file)
+    gw = Gateway(load_config(cfg_file))
+
+    closes = {"n": 0}
+
+    async def fake_close_all(client_id, reason="admin"):
+        closes["n"] += 1
+        return 3
+
+    monkeypatch.setattr(gw.sessions, "close_all_for_client", fake_close_all)
+    client = await make_client(gw)
+    try:
+        resp = await client.delete("/v1/clients/alpaka", headers=auth("admin-token"))
+        body = await resp.json()
+        assert body["closed"] == 3
+        assert closes["n"] == 1
+    finally:
+        await client.close()
 
 
 async def test_health_no_auth_required():

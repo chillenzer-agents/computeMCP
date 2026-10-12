@@ -741,6 +741,121 @@ def test_append_token_hash_replaces_existing(tmp_path):
     assert load_tokens(tok)["ci"] == hash_token("second")
 
 
+# -- remove_client / remove_token_hash (revocation) --------------------------
+
+def _write_two_client_config(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """
+            # operator comment, must be preserved
+            [clients.ci]
+            token = "ci-secret"
+            targets = ["hal"]
+
+            [clients.admin]
+            token = "admin-secret"
+            targets = ["*"]
+
+            [targets.hal]
+            ssh_targets = ["hal"]
+            user = "agent"
+            host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+            """
+        )
+    )
+
+
+def test_remove_client_strips_block_and_preserves_rest(tmp_path):
+    from compute_mcp.config import remove_client
+
+    cfg = tmp_path / "config.toml"
+    _write_two_client_config(cfg)
+    assert remove_client(cfg, "ci") is True
+    text = cfg.read_text()
+    assert "[clients.ci]" not in text
+    assert "# operator comment, must be preserved" in text
+    assert "[clients.admin]" in text
+    assert "[targets.hal]" in text
+    loaded = load_config(cfg, token_file=None)
+    assert set(loaded.clients) == {"admin"}
+
+
+def test_remove_client_unknown_is_noop(tmp_path):
+    from compute_mcp.config import remove_client
+
+    cfg = tmp_path / "config.toml"
+    _write_two_client_config(cfg)
+    before = cfg.read_text()
+    assert remove_client(cfg, "nobody") is False
+    assert cfg.read_text() == before
+
+
+def test_remove_client_refuses_to_leave_zero_clients(tmp_path):
+    from compute_mcp.config import ConfigError, remove_client
+
+    cfg = tmp_path / "config.toml"
+    _write_base_config(cfg)  # exactly one client (ci)
+    before = cfg.read_text()
+    with pytest.raises(ConfigError, match="no clients"):
+        remove_client(cfg, "ci")
+    assert cfg.read_text() == before  # restored
+
+
+def test_remove_client_finds_block_in_include(tmp_path):
+    from compute_mcp.config import load_config, remove_client
+
+    included = tmp_path / "systems" / "clients.toml"
+    included.parent.mkdir(parents=True, exist_ok=True)
+    included.write_text(
+        """
+        [clients.remoteci]
+        token = "remote-secret"
+        targets = ["hal"]
+        """
+    )
+    entry = tmp_path / "gateway.toml"
+    entry.write_text(
+        textwrap.dedent(
+            f"""
+            include = ["{included.relative_to(tmp_path)}"]
+
+            [clients.admin]
+            token = "admin-secret"
+            targets = ["*"]
+
+            [targets.hal]
+            ssh_targets = ["hal"]
+            user = "agent"
+            host_key_sha256 = "SHA256:abcdefghijklmnopqrstuvwxyz0123456789"
+            """
+        )
+    )
+    assert remove_client(entry, "remoteci") is True
+    assert "[clients.remoteci]" not in included.read_text()
+    assert "[clients.admin]" in entry.read_text()
+    assert set(load_config(entry, token_file=None).clients) == {"admin"}
+
+
+def test_remove_token_hash_removes_only_that_entry(tmp_path):
+    from compute_mcp.config import append_token_hash, load_tokens, remove_token_hash
+
+    tok = tmp_path / "tokens.toml"
+    append_token_hash(tok, "ci", "ci-plain")
+    append_token_hash(tok, "admin", "admin-plain")
+    assert remove_token_hash(tok, "ci") is True
+    table = load_tokens(tok)
+    assert "ci" not in table and "admin" in table
+    # Idempotent: a second removal (or an unknown id) is a no-op.
+    assert remove_token_hash(tok, "ci") is False
+    assert remove_token_hash(tok, "ghost") is False
+
+
+def test_remove_token_hash_missing_file_is_noop(tmp_path):
+    from compute_mcp.config import remove_token_hash
+
+    assert remove_token_hash(tmp_path / "nope.toml", "ci") is False
+
+
 # -- route_host_key_sha256 ---------------------------------------------------
 
 def test_route_host_key_sha256_absent_by_default():

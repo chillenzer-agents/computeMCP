@@ -65,6 +65,7 @@ def test_parser_accepts_all_commands():
         ["target-connect", "hal"], ["target-refresh", "hal"], ["target-stop", "hal"],
         ["client-connect", "alpaka"], ["client-refresh", "alpaka"],
         ["client-stop", "alpaka"], ["client-kill", "alpaka"],
+        ["client-revoke", "alpaka"],
     ):
         args = parser.parse_args(base + argv)
         assert args.command == argv[0]
@@ -120,6 +121,38 @@ async def _run_control(monkeypatch, argv, response, cfg=None):
     rc = await control_mod._run(args)
     assert rc == 0
     return calls, timeouts
+
+
+async def test_control_client_revoke_calls_delete(monkeypatch, capsys):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["client-revoke", "alpaka"],
+        {"client": "alpaka", "removed": True, "token_removed": True, "closed": 2},
+    )
+    assert calls == [("DELETE", "/v1/clients/alpaka", None)]
+    out = capsys.readouterr().out
+    assert "revoked alpaka" in out and "token_removed=True" in out
+
+
+async def test_control_client_revoke_force_adds_query(monkeypatch, capsys):
+    calls, _ = await _run_control(
+        monkeypatch,
+        ["client-revoke", "alpaka", "--force"],
+        {"client": "alpaka", "removed": True, "token_removed": True, "closed": 0},
+    )
+    assert calls == [("DELETE", "/v1/clients/alpaka?force=true", None)]
+
+
+async def test_control_client_revoke_json(monkeypatch, capsys):
+    await _run_control(
+        monkeypatch,
+        ["--json", "client-revoke", "alpaka"],
+        {"client": "alpaka", "removed": True, "token_removed": False, "closed": 0},
+    )
+    import json as _json
+
+    body = _json.loads(capsys.readouterr().out)
+    assert body["client"] == "alpaka" and body["token_removed"] is False
 
 
 async def test_control_target_connect_sends_factor(monkeypatch, capsys):
